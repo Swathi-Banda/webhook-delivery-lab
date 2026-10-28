@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Webhook Delivery Lab</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #172033; background: #f3f6fb; }
+    body { max-width: 1000px; margin: 0 auto; padding: 32px 18px; }
+    h1 { margin-bottom: 4px; }
+    .muted { color: #596579; }
+    .card { background: white; border: 1px solid #dce3ed; border-radius: 12px; padding: 20px; margin: 18px 0; box-shadow: 0 2px 8px #1720330b; }
+    label { display: block; font-weight: 650; margin: 14px 0 6px; }
+    input, textarea, button { box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #bac5d4; border-radius: 7px; font: inherit; }
+    textarea { min-height: 120px; font-family: ui-monospace, monospace; }
+    button { margin-top: 16px; background: #145bd7; border-color: #145bd7; color: white; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .status { display: inline-block; font-weight: 700; padding: 4px 10px; border-radius: 999px; background: #e8eef8; }
+    .status[data-state="delivered"] { background: #ddf5e8; color: #126338; }
+    .status[data-state="failed"] { background: #fde4e4; color: #9c2020; }
+    .status[data-state="pending"], .status[data-state="delivering"] { background: #fff1cf; color: #775100; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { padding: 9px; border-bottom: 1px solid #e3e8ef; text-align: left; vertical-align: top; }
+    code { overflow-wrap: anywhere; }
+    #message { white-space: pre-wrap; }
+    @media (min-width: 750px) { .fields { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; } }
+  </style>
+</head>
+<body>
+  <h1>Webhook Delivery Lab</h1>
+  <p class="muted">Submit a test event, then inspect its delivery state and attempt history.</p>
+  <section class="card">
+    <form id="event-form">
+      <label for="idempotency-key">Idempotency key</label>
+      <input id="idempotency-key" required maxlength="200">
+      <p class="muted">Reusing this key with the same event returns the original delivery instead of queueing a duplicate.</p>
+      <label for="target-url">HTTPS target URL</label>
+      <input id="target-url" type="url" required placeholder="https://webhook.site/your-private-id">
+      <p class="muted">Only hostnames configured in the server allowlist will be accepted. Use dummy data.</p>
+      <div class="fields">
+        <div>
+          <label for="event-type">Event type</label>
+          <input id="event-type" required maxlength="120" value="demo.created">
+        </div>
+        <div>
+          <label for="payload">JSON payload</label>
+          <textarea id="payload" required>{"message":"Hello from the delivery lab"}</textarea>
+        </div>
+      </div>
+      <button id="submit" type="submit">Queue event</button>
+    </form>
+  </section>
+  <section class="card" aria-live="polite">
+    <h2>Delivery</h2>
+    <p id="message" class="muted">Submit an event to see its status.</p>
+    <div id="result" hidden>
+      <p>Status: <span id="state" class="status"></span> &nbsp; Attempts: <strong id="attempt-count"></strong></p>
+      <p>Delivery ID: <code id="delivery-id"></code></p>
+      <p id="last-error"></p>
+      <p id="replay-info" class="muted"></p>
+      <button id="replay" type="button" hidden>Replay failed delivery</button>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Attempt</th><th>Status</th><th>HTTP</th><th>Time</th><th>Retry delay</th><th>Details</th></tr></thead>
+          <tbody id="attempts"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+  <script>
+    const form = document.querySelector("#event-form");
+    const button = document.querySelector("#submit");
+    const message = document.querySelector("#message");
+    let active = false;
+    const replayButton = document.querySelector("#replay");
+    document.querySelector("#idempotency-key").value = crypto.randomUUID();
+
+    function cell(row, value) {
+      const td = document.createElement("td");
+      td.textContent = value == null ? "—" : String(value);
+      row.append(td);
+    }
+
+    function render(record) {
+      document.querySelector("#result").hidden = false;
+      const state = document.querySelector("#state");
+      const displayState = record.status === "pending" && record.attempts > 0
+        ? "retrying (backoff)" : record.status;
+      state.textContent = displayState;
+      state.dataset.state = record.status === "pending" && record.attempts > 0
+        ? "delivering" : record.status;
+      document.querySelector("#attempt-count").textContent = record.attempts;
+      document.querySelector("#delivery-id").textContent = record.id;
+      document.querySelector("#replay-info").textContent = record.replay_of
+        ? `Replay of delivery ${record.replay_of}` : "";
+      replayButton.hidden = record.status !== "failed";
+      document.querySelector("#last-error").textContent = record.last_error
+        ? `Last error: ${record.last_error}` : "";
+      const tbody = document.querySelector("#attempts");
+      tbody.replaceChildren();
+      for (const attempt of record.attempt_history) {
+        const row = document.createElement("tr");
+        cell(row, attempt.attempt);
+        cell(row, attempt.status);
+        cell(row, attempt.http_status);
+        cell(row, new Date(attempt.started_at * 1000).toLocaleTimeString());
+        cell(row, attempt.retry_delay_seconds == null ? null : `${attempt.retry_delay_seconds}s`);
+        cell(row, attempt.error);
+        tbody.append(row);
+      }
+    }
+
+    async function watch(id) {
+      for (let count = 0; count < 60; count++) {
+        const response = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}`);
+        const record = await response.json();
+        if (!response.ok) throw new Error(record.detail || "Could not read delivery status");
+        render(record);
+        if (record.status === "delivered" || record.status === "failed") return;
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+
+      replayButton.addEventListener("click", async () => {
+        const id = document.querySelector("#delivery-id").textContent;
+        replayButton.disabled = true;
+        try {
+          const response = await fetch(`/api/v1/webhooks/${encodeURIComponent(id)}/replay`, {
+            method: "POST"
+          });
+          const result = await response.json();
+          if (!response.ok) throw new Error(result.detail || JSON.stringify(result));
+          message.textContent = `Replay queued as ${result.id}; watching status…`;
+          await watch(result.id);
+          message.textContent = "Replay processing finished.";
+        } catch (error) {
+          message.textContent = `Could not replay delivery: ${error.message}`;
+        } finally {
+          replayButton.disabled = false;
+        }
+      });
+      message.textContent = "Still processing; refresh the page or check the delivery ID later.";
+    }
+
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (active) return;
+      active = true;
+      button.disabled = true;
+      message.textContent = "Submitting event…";
+      try {
+        const payload = JSON.parse(document.querySelector("#payload").value);
+        if (payload === null || Array.isArray(payload) || typeof payload !== "object") {
+          throw new Error("Payload must be a JSON object.");
+        }
+        const response = await fetch("/api/v1/webhooks", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": document.querySelector("#idempotency-key").value
+          },
+          body: JSON.stringify({
+            target_url: document.querySelector("#target-url").value,
+            event_type: document.querySelector("#event-type").value,
+            payload
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || JSON.stringify(result));
+        message.textContent = result.deduplicated
+          ? "This idempotency key already exists; showing the original delivery."
+          : "Event queued; watching delivery status…";
+        await watch(result.id);
+        message.textContent = result.deduplicated
+          ? "Original delivery status shown."
+          : "Delivery processing finished.";
+      } catch (error) {
+        message.textContent = `Could not complete request: ${error.message}`;
+      } finally {
+        active = false;
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
